@@ -1,9 +1,11 @@
-from flask import Flask, request, jsonify, redirect, url_for, send_from_directory
+from flask import Flask, request, jsonify, redirect, url_for, send_from_directory, session
 import os
 from groq import Groq
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import logging
+from authlib.integrations.flask_client import OAuth
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -13,10 +15,28 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 app = Flask(__name__)
+app.secret_key = '9fd7f05d817e0bfe6a1662f004f0cbd0' # Required for sessions
+app.config['SESSION_COOKIE_SECURE'] = True
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)
 
 # Configure app for production
 app.config['PROPAGATE_EXCEPTIONS'] = True
 app.config['JSON_SORT_KEYS'] = False
+
+# OAuth Configuration
+oauth = OAuth(app)
+google = oauth.register(
+    name='google',
+    client_id='651880928848-iuvuu88h93ulv3o7rlvtsr6u0slfsrj5.apps.googleusercontent.com',
+    client_secret='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',
+    access_token_url='https://accounts.google.com/o/oauth2/token',
+    access_token_params=None,
+    authorize_url='https://accounts.google.com/o/oauth2/auth',
+    authorize_params=None,
+    api_base_url='https://www.googleapis.com/oauth2/v1/',
+    client_kwargs={'scope': 'openid email profile'},
+    jwks_uri='https://www.googleapis.com/oauth2/v3/certs'  # Explicitly add JWKS URI
+)
 
 # Ensure static folders exist
 os.makedirs('static/css', exist_ok=True)
@@ -73,21 +93,22 @@ def generate_response(prompt):
         print(f"Error generating response: {e}")
         return "I'm sorry, I'm having trouble generating a response right now."
 
-def get_conversation_context(username):
+def get_conversation_context(user_id):
     """Build conversation context from previous exchanges."""
-    session = users[username].get("session", [])
+    session = users[user_id].get("session", [])
     context = ""
     for exchange in session:
         context += f"User: {exchange['user']}\nM: {exchange['bot']}\n"
     return context
 
-def get_empathy_response(username, user_message):
+def get_empathy_response(user_id, user_message):
     """Generate a context-aware response including user profile data."""
     # Retrieve conversation history
-    conversation_context = get_conversation_context(username)
+    conversation_context = get_conversation_context(user_id)
     
     # Retrieve user profile details from login data
-    user_profile = users[username]
+    user_profile = users[user_id]
+    display_name = user_profile.get("display_name", "user")
     pronouns = user_profile.get("pronouns", "not specified")
     identity_goals = user_profile.get("identity_goals", "not specified")
     focus_areas = user_profile.get("focus_areas", "not specified")
@@ -95,7 +116,7 @@ def get_empathy_response(username, user_message):
     # Build user profile context
     user_info = (
         f"User Profile:\n"
-        f"Username: {username}\n"
+        f"Name: {display_name}\n"
         f"Pronouns: {pronouns}\n"
         f"Identity Goals: {identity_goals}\n"
         f"Focus Areas: {focus_areas}\n\n"
@@ -114,55 +135,135 @@ def get_empathy_response(username, user_message):
     )
     return generate_response(prompt)
 
+# ------------------ Authentication routes ------------------
+
+@app.route('/login')
+def login():
+    """Redirect to Google OAuth login."""
+    redirect_uri = url_for('authorize', _external=True)
+    return google.authorize_redirect(redirect_uri)
+
+@app.route('/authorize')
+def authorize():
+    """Handle the OAuth callback."""
+    token = google.authorize_access_token()
+    user_info = google.get('userinfo').json()
+    
+    # Store user info in session
+    session['user_id'] = user_info['id']
+    session['user_email'] = user_info['email']
+    session['user_name'] = user_info.get('name', '')
+    session['profile_picture'] = user_info.get('picture', '')
+    
+    # Create or update user in our system
+    if user_info['id'] not in users:
+        users[user_info['id']] = {
+            "email": user_info['email'],
+            "display_name": user_info.get('name', user_info['email'].split('@')[0]),
+            "profile_picture": user_info.get('picture', ''),
+            "pronouns": "",
+            "identity_goals": "",
+            "focus_areas": "",
+            "session": []
+        }
+    
+    # Redirect to profile completion or chat based on whether user has completed profile
+    if not users[user_info['id']].get("pronouns") and not users[user_info['id']].get("identity_goals"):
+        return redirect(url_for('profile_form'))
+    else:
+        return redirect(url_for('chat_form'))
+
+@app.route('/logout')
+def logout():
+    """Log the user out and clear session."""
+    session.pop('user_id', None)
+    session.pop('user_email', None)
+    session.pop('user_name', None)
+    session.pop('profile_picture', None)
+    return redirect(url_for('index'))
+
+# ------------------ New profile route ------------------
+
+@app.route("/profile", methods=["GET"])
+def profile_form():
+    """Display the profile completion form."""
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    
+    user_id = session['user_id']
+    user = users.get(user_id, {})
+    
+    content = f'''
+    <div class="container">
+        <img src="/static/images/logo.png" alt="M Logo" class="logo">
+        <h1>Complete Your Profile</h1>
+        <p class="subtitle">Share a bit about yourself so I can better support you</p>
+        <div class="user-profile-header">
+            <img src="{session.get('profile_picture', '/static/images/default-avatar.png')}" alt="Profile Picture" class="profile-picture">
+            <div class="user-info">
+                <h3>{session.get('user_name', 'User')}</h3>
+                <p>{session.get('user_email', '')}</p>
+            </div>
+        </div>
+        <form action="/api/update_profile" method="post">
+            <input type="hidden" name="user_id" value="{user_id}">
+            <div class="form-group">
+                <label for="pronouns">Your Pronouns</label>
+                <input type="text" id="pronouns" name="pronouns" value="{user.get('pronouns', '')}" placeholder="e.g., they/them, she/her, he/him">
+            </div>
+            <div class="form-group">
+                <label for="identity_goals">What brings you here today?</label>
+                <textarea id="identity_goals" name="identity_goals" placeholder="Share your goals or what you'd like to work on...">{user.get('identity_goals', '')}</textarea>
+            </div>
+            <div class="form-group">
+                <label for="focus_areas">Areas you'd like to focus on</label>
+                <input type="text" id="focus_areas" name="focus_areas" value="{user.get('focus_areas', '')}" placeholder="e.g., Anxiety, Self-Discovery, Personal Growth">
+            </div>
+            <button type="submit" class="btn" style="width: 100%;">
+                <i class="fas fa-heart"></i> Save Profile & Continue
+            </button>
+        </form>
+    </div>
+    '''
+    return get_base_template().format(content=content)
+
 # ------------------ API Endpoints ------------------
 
-@app.route("/api/login", methods=["POST"])
-def api_login():
-    """Handle user login and profile creation."""
-    data = request.get_json() if request.is_json else request.form
-    username = data.get("username")
-    pronouns = data.get("pronouns")
-    identity_goals = data.get("identity_goals")
-    focus_areas = data.get("focus_areas")
+@app.route("/api/update_profile", methods=["POST"])
+def api_update_profile():
+    """Handle profile updates."""
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
     
-    if not username:
-        if request.is_json:
-            return jsonify({"error": "username is required"}), 400
-        else:
-            return "Username is required", 400
+    user_id = session['user_id']
+    data = request.form
     
-    # Save or update the user profile
-    users[username] = {
-        "pronouns": pronouns,
-        "identity_goals": identity_goals,
-        "focus_areas": focus_areas,
-        "session": []
-    }
+    # Update user profile
+    users[user_id]["pronouns"] = data.get("pronouns", "")
+    users[user_id]["identity_goals"] = data.get("identity_goals", "")
+    users[user_id]["focus_areas"] = data.get("focus_areas", "")
     
-    if request.is_json:
-        return jsonify({"message": f"Welcome, {username}! Your preferences have been saved."}), 200
-    else:
-        return redirect(url_for("chat_form", username=username))
+    return redirect(url_for("chat_form"))
 
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
     """Handle chat messages and generate context-aware responses."""
+    if 'user_id' not in session:
+        return jsonify({"error": "Not authenticated"}), 401
+    
+    user_id = session['user_id']
     data = request.get_json() if request.is_json else request.form
-    username = data.get("username")
     message = data.get("message")
     
-    if not username or not message:
-        return jsonify({"error": "username and message are required"}), 400
-    
-    if username not in users:
-        return jsonify({"error": "User not found. Please log in first."}), 404
+    if not message:
+        return jsonify({"error": "Message is required"}), 400
     
     # Generate a response with conversation context and user profile data
-    response_text = get_empathy_response(username, message)
+    response_text = get_empathy_response(user_id, message)
     current_time = datetime.now().strftime("%I:%M %p")
     
     # Store the exchange in the user's session history
-    users[username]["session"].append({
+    users[user_id]["session"].append({
         "user": message,
         "bot": response_text,
         "time": current_time
@@ -173,17 +274,17 @@ def api_chat():
 @app.route("/api/feedback", methods=["POST"])
 def api_feedback():
     """Handle user feedback."""
+    if 'user_id' not in session:
+        return jsonify({"error": "Not authenticated"}), 401
+    
+    user_id = session['user_id']
     data = request.get_json() if request.is_json else request.form
-    username = data.get("username")
     feedback_message = data.get("feedback")
     
-    if not username or not feedback_message:
-        return jsonify({"error": "username and feedback are required"}), 400
+    if not feedback_message:
+        return jsonify({"error": "Feedback is required"}), 400
     
-    if username not in users:
-        return jsonify({"error": "User not found."}), 404
-    
-    print(f"Feedback from {username}: {feedback_message}")
+    print(f"Feedback from {user_id}: {feedback_message}")
     return jsonify({"message": "Thank you for your feedback!"}), 200
 
 # ------------------ Simple Web Interface ------------------
@@ -221,7 +322,7 @@ def index():
         </p>
         <div style="display: flex; justify-content: center; gap: 1.5rem;">
             <a href="/login" class="btn" style="background-color: var(--primary-color);">
-                <i class="fas fa-user-plus"></i> Get Started
+                <i class="fas fa-sign-in-alt"></i> Sign in with Google
             </a>
             <a href="/chat" class="btn" style="background-color: var(--success-color);">
                 <i class="fas fa-comments"></i> Continue Chat
@@ -231,71 +332,41 @@ def index():
     '''
     return get_base_template().format(content=content)
 
-@app.route("/login", methods=["GET"])
-def login_form():
-    """Display the login form."""
-    content = '''
-    <div class="container">
-        <img src="/static/images/logo.png" alt="M Logo" class="logo">
-        <h1>Begin Your Journey</h1>
-        <p class="subtitle">Share a bit about yourself so I can better support you</p>
-        <form action="/api/login" method="post">
-            <div class="form-group">
-                <label for="username">Choose a Username</label>
-                <input type="text" id="username" name="username" placeholder="A name you'd like to be called" required>
-            </div>
-            <div class="form-group">
-                <label for="pronouns">Your Pronouns</label>
-                <input type="text" id="pronouns" name="pronouns" placeholder="e.g., they/them, she/her, he/him">
-            </div>
-            <div class="form-group">
-                <label for="identity_goals">What brings you here today?</label>
-                <textarea id="identity_goals" name="identity_goals" placeholder="Share your goals or what you'd like to work on..."></textarea>
-            </div>
-            <div class="form-group">
-                <label for="focus_areas">Areas you'd like to focus on</label>
-                <input type="text" id="focus_areas" name="focus_areas" placeholder="e.g., Anxiety, Self-Discovery, Personal Growth">
-            </div>
-            <button type="submit" class="btn" style="width: 100%;">
-                <i class="fas fa-heart"></i> Begin Your Journey
-            </button>
-        </form>
-        <div class="nav-links">
-            Already have a session? <a href="/chat">Continue Chat</a>
-        </div>
-    </div>
-    '''
-    return get_base_template().format(content=content)
-
 @app.route("/chat", methods=["GET"])
 def chat_form():
     """Display the chat form with conversation history."""
-    username = request.args.get("username", "")
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
     
-    # Get conversation history if user exists
+    user_id = session['user_id']
+    user = users.get(user_id, {})
+    
+    if not user:
+        return redirect(url_for('login'))
+    
+    # Get conversation history
     chat_history = ""
-    if username and username in users:
-        for message in users[username]["session"]:
-            chat_history += f'''
-            <div class="message-container">
-                <div class="message user">
-                    <div class="message-header">
-                        <i class="fas fa-user-circle"></i> You
-                    </div>
-                    {message["user"]}
-                    <div class="message-time">{message.get("time", "")}</div>
+    for message in user.get("session", []):
+        chat_history += f'''
+        <div class="message-container">
+            <div class="message user">
+                <div class="message-header">
+                    <img src="{session.get('profile_picture', '/static/images/default-avatar.png')}" class="avatar" alt="You"> You
                 </div>
+                {message["user"]}
+                <div class="message-time">{message.get("time", "")}</div>
             </div>
-            <div class="message-container">
-                <div class="message bot">
-                    <div class="message-header">
-                        <i class="fas fa-robot"></i> M
-                    </div>
-                    {message["bot"]}
-                    <div class="message-time">{message.get("time", "")}</div>
+        </div>
+        <div class="message-container">
+            <div class="message bot">
+                <div class="message-header">
+                    <i class="fas fa-robot"></i> M
                 </div>
+                {message["bot"]}
+                <div class="message-time">{message.get("time", "")}</div>
             </div>
-            '''
+        </div>
+        '''
 
     content = f'''
     <div class="chat-container">
@@ -304,11 +375,15 @@ def chat_form():
                 <img src="/static/images/logo.png" alt="M Logo" class="header-logo">
                 <h1>Chat with M</h1>
                 <div class="header-actions">
+                    <div class="user-dropdown">
+                        <img src="{session.get('profile_picture', '/static/images/default-avatar.png')}" class="header-avatar" alt="{session.get('user_name', 'User')}">
+                        <div class="dropdown-content">
+                            <a href="/profile"><i class="fas fa-user-edit"></i> Edit Profile</a>
+                            <a href="/logout"><i class="fas fa-sign-out-alt"></i> Logout</a>
+                        </div>
+                    </div>
                     <a href="/" class="header-link" title="Home">
                         <i class="fas fa-home"></i>
-                    </a>
-                    <a href="/login" class="header-link" title="Switch User">
-                        <i class="fas fa-user"></i>
                     </a>
                 </div>
             </div>
@@ -326,7 +401,6 @@ def chat_form():
         <div class="chat-input-container">
             <div class="chat-input-wrapper">
                 <form action="/api/chat" method="post" id="chatForm">
-                    <input type="hidden" name="username" value="{username}">
                     <textarea 
                         class="chat-input" 
                         id="message" 
@@ -404,7 +478,7 @@ def chat_form():
                     <div class="message-container">
                         <div class="message user">
                             <div class="message-header">
-                                <i class="fas fa-user-circle"></i> You
+                                <img src="{session.get('profile_picture', '/static/images/default-avatar.png')}" class="avatar" alt="You"> You
                             </div>
                             ${{textarea.value}}
                             <div class="message-time">${{currentTime}}</div>
